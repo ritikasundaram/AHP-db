@@ -9,6 +9,21 @@ import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 
+from persistence.engine import ping_db, get_engine
+from persistence.repositories.decision_repo import DecisionRepo
+from persistence.repositories.scenario_repo import ScenarioRepo
+from persistence.repositories.alternative_repo import AlternativeRepo
+from persistence.repositories.criterion_repo import CriterionRepo
+from persistence.repositories.measurement_repo import MeasurementRepo
+from persistence.repositories.preference_repo import PreferenceRepo
+from persistence.repositories.ahp_repo import AHPRepo
+from persistence.repositories.run_repo import RunRepo
+from persistence.repositories.result_repo import ResultRepo
+from services.ahp_service import AHPService
+from services.scenario_service import ScenarioService
+from core.ahp import upper_size as core_upper_size
+from sqlalchemy import text as sa_text
+
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="AHP Baseball", layout="wide", page_icon="⚾")
 
@@ -107,6 +122,76 @@ _init()
 S = st.session_state
 
 # ─────────────────────────────────────────────────────────────────────────────
+# DATABASE INTEGRATION — sidebar
+# ─────────────────────────────────────────────────────────────────────────────
+S.setdefault("db_enabled", False)
+S.setdefault("db_decision_id", None)
+S.setdefault("db_scenario_id", None)
+S.setdefault("db_pref_set_id", None)
+S.setdefault("db_last_run_id", None)
+
+with st.sidebar:
+    st.markdown("### Database")
+    S["db_enabled"] = st.toggle("Enable DB Persistence", value=S["db_enabled"])
+
+    if S["db_enabled"]:
+        db_ok = ping_db()
+        st.write("Connection:", "Connected" if db_ok else "Failed")
+        if not db_ok:
+            st.warning("DATABASE_URL not set or unreachable. Add it to `.env`.")
+        else:
+            engine = get_engine()
+            decision_repo = DecisionRepo(engine)
+            scenario_repo = ScenarioRepo(engine)
+
+            # ── Decision selector ────────────────────────────────────────────
+            decisions = decision_repo.list_decisions(limit=50)
+            dec_options = ["Create new…"] + [d["decision_id"] for d in decisions]
+            sel_dec = st.selectbox(
+                "Decision",
+                options=dec_options,
+                format_func=lambda x: "Create new…" if x == "Create new…" else next(
+                    (dd["title"] for dd in decisions if dd["decision_id"] == x), x[:8]
+                ),
+                key="db_dec_sel",
+            )
+            if sel_dec == "Create new…":
+                dec_title = st.text_input("Decision title", value="Baseball Player Evaluation", key="db_dec_title")
+                if st.button("Create Decision", key="db_dec_btn"):
+                    S["db_decision_id"] = decision_repo.create_decision(dec_title.strip())
+                    st.success(f"Created: {S['db_decision_id'][:12]}…")
+                    st.rerun()
+            else:
+                S["db_decision_id"] = sel_dec
+
+            # ── Scenario selector ────────────────────────────────────────────
+            if S["db_decision_id"]:
+                scenarios = scenario_repo.list_scenarios(S["db_decision_id"], limit=50)
+                scen_options = ["Create new…"] + [s["scenario_id"] for s in scenarios]
+                sel_scen = st.selectbox(
+                    "Scenario",
+                    options=scen_options,
+                    format_func=lambda x: "Create new…" if x == "Create new…" else next(
+                        (ss["name"] for ss in scenarios if ss["scenario_id"] == x), x[:8]
+                    ),
+                    key="db_scen_sel",
+                )
+                if sel_scen == "Create new…":
+                    scen_name = st.text_input("Scenario name", value="AHP Baseball", key="db_scen_name")
+                    if st.button("Create Scenario", key="db_scen_btn"):
+                        S["db_scenario_id"] = scenario_repo.create_scenario(
+                            decision_id=S["db_decision_id"], name=scen_name.strip(),
+                        )
+                        st.success(f"Created: {S['db_scenario_id'][:12]}…")
+                        st.rerun()
+                else:
+                    S["db_scenario_id"] = sel_scen
+
+            st.divider()
+            ready = bool(S.get("db_decision_id") and S.get("db_scenario_id"))
+            st.write("Ready to persist:", "Yes" if ready else "No — select decision + scenario")
+
+# ─────────────────────────────────────────────────────────────────────────────
 # HEADER
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown('<div class="badge">AHP • ANALYTIC HIERARCHY PROCESS</div>', unsafe_allow_html=True)
@@ -151,11 +236,12 @@ st.markdown("<hr>", unsafe_allow_html=True)
 # ─────────────────────────────────────────────────────────────────────────────
 # TABS
 # ─────────────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "⚙️  Setup",
     "📊  Criteria Pairwise",
     "🏟️  Player Scores",
     "🏆  Results",
+    "💾  Database",
 ])
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -606,3 +692,183 @@ with tab4:
         file_name="ahp_baseball_results.csv",
         mime="text/csv",
     )
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 5 — DATABASE
+# ═════════════════════════════════════════════════════════════════════════════
+with tab5:
+    if not S.get("db_enabled"):
+        st.info("Enable **DB Persistence** in the sidebar to use database features.")
+        st.stop()
+
+    if not ping_db():
+        st.error("Database not reachable. Check `DATABASE_URL` in `.env`.")
+        st.stop()
+
+    engine = get_engine()
+    scenario_id = S.get("db_scenario_id")
+    decision_id = S.get("db_decision_id")
+
+    if not decision_id or not scenario_id:
+        st.warning("Select a **Decision** and **Scenario** in the sidebar first.")
+        st.stop()
+
+    alt_repo   = AlternativeRepo(engine)
+    crit_repo  = CriterionRepo(engine)
+    meas_repo  = MeasurementRepo(engine)
+    pref_repo  = PreferenceRepo(engine)
+    ahp_repo   = AHPRepo(engine)
+    run_repo   = RunRepo(engine)
+    result_repo = ResultRepo(engine)
+    ahp_svc    = AHPService(engine)
+    scen_svc   = ScenarioService(engine)
+
+    st.markdown("#### Save Current AHP to Database")
+    st.caption(
+        "Persists alternatives, criteria, raw scores (as measurements), "
+        "pairwise judgments, AHP results, and final ranking into the database."
+    )
+
+    if S["result"] is None:
+        st.info("Run AHP first (click **▶ Run AHP** at the top), then come back here to save.")
+    else:
+        R = S["result"]
+
+        if st.button("💾  Save to Database", type="primary"):
+            try:
+                players = S["players"]
+                crits   = S["criteria"]
+                nc = len(crits)
+                na = len(players)
+
+                # ── 1. Upsert alternatives + criteria ────────────────────────
+                alt_map = alt_repo.upsert_by_names(scenario_id, players)
+                crit_rows = [
+                    {"name": c, "direction": "benefit", "scale_type": "ratio",
+                     "unit": "score", "description": None}
+                    for c in crits
+                ]
+                crit_map = crit_repo.upsert_rows(scenario_id, crit_rows)
+
+                # ── 2. Save raw scores as measurements ───────────────────────
+                raw = S["scores"].astype(float)
+                matrix_ui = pd.DataFrame(raw, index=players, columns=crits)
+                meas_repo.replace_all_for_scenario(scenario_id, alt_map, crit_map, matrix_ui)
+
+                # ── 3. Create / get AHP preference set ───────────────────────
+                pref_id = pref_repo.get_or_create_preference_set(
+                    scenario_id=scenario_id,
+                    name="AHP Baseball Weights",
+                    pref_type="ahp",
+                    created_by="ahp_baseball",
+                )
+                S["db_pref_set_id"] = pref_id
+
+                # ── 4. Save criteria pairwise judgments ──────────────────────
+                crit_ids_ordered = [crit_map[c] for c in crits]
+                jmt_rows = []
+                idx = 0
+                for i in range(nc):
+                    for j in range(i + 1, nc):
+                        v = float(S["crit_upper"][idx])
+                        ii, ij = crit_ids_ordered[i], crit_ids_ordered[j]
+                        jmt_rows.append({"criterion_i_id": ii, "criterion_j_id": ij, "judgment": v})
+                        jmt_rows.append({"criterion_i_id": ij, "criterion_j_id": ii, "judgment": 1.0 / v})
+                        idx += 1
+                ahp_repo.save_criteria_judgments(pref_id, jmt_rows)
+
+                # ── 5. Save AHP-derived weights into criterion_weights ───────
+                crit_pv = R["crit_pv"]
+                del_w = "DELETE FROM criterion_weights WHERE preference_set_id = :pid"
+                ins_w = """
+                    INSERT INTO criterion_weights
+                           (preference_set_id, criterion_id, weight, weight_type, derived_from)
+                    VALUES (:pid, :criterion_id, :weight, 'normalized', 'ahp')
+                """
+                w_payloads = [
+                    {"pid": pref_id, "criterion_id": crit_map[crits[k]], "weight": float(crit_pv[k])}
+                    for k in range(nc)
+                ]
+                with engine.begin() as conn:
+                    conn.execute(sa_text(del_w), {"pid": pref_id})
+                    if w_payloads:
+                        conn.execute(sa_text(ins_w), w_payloads)
+
+                # ── 6. Run AHP via service (persist run + artifacts) ─────────
+                data = scen_svc.load(scenario_id, pref_id)
+                run_id = ahp_svc.run_and_persist(
+                    scenario_id=scenario_id,
+                    preference_set_id=pref_id,
+                    executed_by="ahp_baseball",
+                    data=data,
+                    crit_upper=list(S["crit_upper"]),
+                    alt_upper_by_crit={},
+                    mode="hybrid",
+                )
+                S["db_last_run_id"] = run_id
+
+                st.success(f"Saved to database. Run ID: `{run_id}`")
+
+                # Show persisted ranking
+                scores = result_repo.get_scores_with_names(run_id)
+                if scores:
+                    st.markdown("**Persisted Ranking:**")
+                    st.dataframe(pd.DataFrame(scores), use_container_width=True, hide_index=True)
+
+            except Exception as e:
+                st.error(f"Error saving to database: {e}")
+
+    st.divider()
+
+    # ── Run History ───────────────────────────────────────────────────────────
+    st.markdown("#### Run History")
+    runs = run_repo.list_runs(scenario_id, limit=50)
+    if not runs:
+        st.info("No runs saved for this scenario yet.")
+    else:
+        runs_df = pd.DataFrame(runs)
+        st.dataframe(
+            runs_df[["executed_at", "method", "executed_by", "run_id"]],
+            use_container_width=True, hide_index=True,
+        )
+
+        # ── Inspect a past run ────────────────────────────────────────────────
+        st.markdown("**Inspect a Run**")
+        sel_run_id = st.selectbox(
+            "Select run",
+            options=[r["run_id"] for r in runs],
+            format_func=lambda x: next(
+                f"[{rr['method'].upper()}] {rr['executed_at']}"
+                for rr in runs if rr["run_id"] == x
+            ),
+            key="db_inspect_run",
+        )
+
+        if sel_run_id:
+            scores = result_repo.get_scores_with_names(sel_run_id)
+            if scores:
+                st.markdown("**Ranking:**")
+                st.dataframe(pd.DataFrame(scores), use_container_width=True, hide_index=True)
+
+            artifacts = ahp_repo.get_run_artifacts(sel_run_id)
+            if artifacts:
+                cr_val = float(artifacts["criteria_cr"])
+                cr_color = "green" if cr_val < 0.10 else "red"
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    st.metric("Criteria CR", f"{cr_val:.4f}")
+                with c2:
+                    st.metric("λ_max", f"{float(artifacts['lambda_max']):.4f}")
+                with c3:
+                    st.metric("Mode", artifacts["mode"].title())
+
+            crit_prio_df = ahp_repo.get_criterion_priorities(sel_run_id)
+            if not crit_prio_df.empty:
+                crit_prio_df["weight_%"] = (crit_prio_df["priority"] * 100).round(2).astype(str) + "%"
+                st.markdown("**Criterion Priorities:**")
+                st.dataframe(crit_prio_df, use_container_width=True, hide_index=True)
+
+            alt_prio_df = ahp_repo.get_alternative_priorities(sel_run_id)
+            if not alt_prio_df.empty:
+                st.markdown("**Alternative Priorities per Criterion:**")
+                st.dataframe(alt_prio_df, use_container_width=True, hide_index=True)
